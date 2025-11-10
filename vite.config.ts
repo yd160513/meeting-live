@@ -13,6 +13,12 @@ export default defineConfig({
     vueDevTools(),
   ],
   server: {
+    host: '0.0.0.0',
+    port: 8080,
+    https: {
+      key: './cert/key.pem',
+      cert: './cert/cert.pem',
+    },
     proxy: {
       '/socket.io': {
         target: 'http://localhost:3000',
