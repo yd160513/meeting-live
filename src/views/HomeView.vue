@@ -1,6 +1,6 @@
 <!-- src/views/HomeView.vue -->
 <script setup lang="ts">
-import {ref, onUnmounted} from 'vue'
+import {ref, onUnmounted, computed} from 'vue'
 import {useRoute} from 'vue-router'
 import {io} from "socket.io-client"
 import {Button, Card, Row, Col} from 'ant-design-vue'
@@ -12,6 +12,27 @@ const route = useRoute()
 const roomId = (route.query.roomId || '') as string
 const targetId = (route.query.targetId || '') as string
 const userId = (route.query.userId || '') as string
+
+const datachannel = ref(null)
+const channelValue = ref('')
+const remoteMsg = ref('')
+const sendMsg =() => {
+  debugger
+  if (datachannel.value) {
+    datachannel.value.send(channelValue.value)
+  }
+}
+
+// 摄像头状态
+const isCloseCamera = ref(false)
+const cameraStatus = computed(() => {
+  return !isCloseCamera.value ? '关闭' : '开启'
+})
+// 麦克风状态
+const isCloseMic = ref(false)
+const micStatus = computed(() => {
+  return !isCloseMic.value ? '关闭' : '开启'
+})
 
 let pc = null
 
@@ -71,8 +92,56 @@ socket.on('message', async (data) => {
   }
 })
 
+// 切换摄像头状态
+const changeCameraStatus = () => {
+  const senders = pc.getSenders()
+  // 找到视频发送者
+  const videoSender = senders.find(sender => sender.track.kind === 'video')
+  if (videoSender) {
+    videoSender.track.enabled = !videoSender.track.enabled
+
+    isCloseCamera.value = !videoSender.track.enabled
+  }
+}
+
+// 切换麦克风状态
+const changeMicStatus = () => {
+  const senders = pc.getSenders()
+  // 找到音频发送者
+  const audioSender = senders.find(sender => sender.track.kind === 'audio')
+  if (audioSender) {
+    audioSender.track.enabled = !audioSender.track.enabled
+
+    isCloseMic.value = !audioSender.track.enabled
+  }
+}
+
+// 切换摄像头
+const changeCamera = async () => {
+  // 获取后置摄像头媒体流
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: 'environment'
+    }
+  })
+  const [videoTrack] = stream.getVideoTracks()
+
+  // 找到视频发送者，替换
+  const senders = pc.getSenders()
+  const videoSender = senders.find(sender => sender.track.kind === 'video')
+  if (videoSender) {
+    videoSender.replaceTrack(videoTrack)
+  }
+
+  // TODO: 解决: 切换摄像头之后，本地视频流不展示了。这种方式是否合适？
+  const localVideo = document.getElementById('local') as HTMLVideoElement
+  if (localVideo) {
+    localVideo.srcObject = stream
+  }
+}
+
 // 构建消息
-const buildMessage = (type: string, userId: string, roomId: string, targetId?: string, data:any = null) => {
+const buildMessage = (type: string, userId: string, roomId: string, targetId?: string, data: any = null) => {
   return {
     type,
     data: {
@@ -131,6 +200,27 @@ const onCallHandle = async ({data}: any) => {
     pc.addTrack(track, stream)
   })
 
+
+  // 创建 datachannel
+  datachannel.value = pc.createDataChannel('dataChannel', {
+    protocol: 'json',
+    // ordered: true
+  })
+
+  pc.ondatachannel = (event) => {
+    console.log('ondatachannel: ', event)
+    event.channel.onmessage = (event) => {
+      console.log('channel.onmessage: ', event)
+      remoteMsg.value = event.data
+    }
+    event.channel.onopen = () => {
+      console.log('channel.onopen: ')
+    }
+    event.channel.onclose = () => {
+      console.log('channel.onclose: ')
+    }
+  }
+
   pc.oniceconnectionstatechange = () => {
     console.log('ICE连接状态变化:', pc.iceConnectionState);
     if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
@@ -171,7 +261,7 @@ const onCallHandle = async ({data}: any) => {
       const newStream = new MediaStream()
       newStream.addTrack(event.track)
       remoteVideo.srcObject = newStream
-      remoteVideo.muted = true
+      // remoteVideo.muted = true
     }
   }
 
@@ -200,6 +290,7 @@ const callHandle = async () => {
     audio: true
   })
 
+  // TODO: 自己还能听见自己的声音，怎么解决？
   const localVideo = document.getElementById('local') as HTMLVideoElement
   if (localVideo) {
     localVideo.srcObject = stream
@@ -208,6 +299,26 @@ const callHandle = async () => {
   stream.getTracks().forEach(track => {
     pc.addTrack(track, stream)
   })
+
+  // 创建 datachannel
+  datachannel.value = pc.createDataChannel('dataChannel', {
+    protocol: 'json',
+    // ordered: true
+  })
+
+  pc.ondatachannel = (event) => {
+    console.log('ondatachannel: ', event)
+    event.channel.onmessage = (event) => {
+      console.log('channel.onmessage: ', event)
+      remoteMsg.value = JSON.parse(event.data)
+    }
+    event.channel.onopen = () => {
+      console.log('channel.onopen: ')
+    }
+    event.channel.onclose = () => {
+      console.log('channel.onclose: ')
+    }
+  }
 
   pc.oniceconnectionstatechange = () => {
     console.log('ICE连接状态变化:', pc.iceConnectionState);
@@ -238,9 +349,15 @@ const callHandle = async () => {
   // 设置远程流监听
   pc.ontrack = (event) => {
     console.warn('call ontrack: ', event)
+    /**
+     * TODO: 保存远端媒体流只保存 track 可以吗？
+     *        还是要保存 const newStream = new MediaStream()
+     *       newStream.addTrack(event.track) 这样的？
+     */
     remoteStream.value = event.track
     const remoteVideo = document.getElementById('remote') as HTMLVideoElement
     console.log('remoteVideo: ', remoteVideo)
+    // TODO: 这里是不是赋值方式是否可以优化
     const stream = remoteVideo.srcObject
     if (stream) {
       stream.addTrack(event.track)
@@ -248,7 +365,7 @@ const callHandle = async () => {
       const newStream = new MediaStream()
       newStream.addTrack(event.track)
       remoteVideo.srcObject = newStream
-      remoteVideo.muted = true
+      // remoteVideo.muted = true
     }
   }
 
@@ -316,7 +433,14 @@ onUnmounted(() => {
         </Col>
       </Row>
 
-      <a-button>test</a-button>
+      <a-button @click="changeCameraStatus">{{ cameraStatus }}摄像头</a-button>
+      <a-button @click="changeMicStatus">{{ micStatus }}麦克风</a-button>
+      <a-button @click="changeCamera">切换摄像头</a-button>
+      <a-input v-model:value="channelValue" placeholder="请输入" />
+      <a-button @click="sendMsg">发送</a-button>
+      <div>
+        <p v-if="remoteMsg">{{ remoteMsg }}</p>
+      </div>
 
       <div class="control-panel">
         <Button
