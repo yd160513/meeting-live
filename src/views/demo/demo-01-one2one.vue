@@ -16,7 +16,7 @@
             <button
                 v-if="participant.userId !== currentUserId && !isCalling"
                 class="call-button"
-                @click="callParticipant(participant.userId)"
+                @click="initiateCall(participant.userId)"
             >
               通话
             </button>
@@ -40,7 +40,7 @@
           <div class="video-label">我</div>
         </div>
         <div class="remote-video-wrapper">
-          <video ref="remoteVideo" autoplay playsinline muted class="remote-video"></video>
+          <video ref="remoteVideo" autoplay playsinline class="remote-video"></video>
           <div class="video-label">对方</div>
         </div>
       </div>
@@ -71,27 +71,35 @@
 </template>
 
 <script setup lang="ts">
-import {ref, onMounted, nextTick, h} from 'vue'
-import {useRoute} from 'vue-router'
-import {io} from "socket.io-client";
-import {message, notification, Button} from 'ant-design-vue';
+import { ref, onMounted, onUnmounted } from 'vue'
+import { useRoute } from 'vue-router'
+import { io } from "socket.io-client"
+import { message } from 'ant-design-vue'
 
-// 获取URL参数: https://localhost:8080/?userId=111&roomId=10086&targetId=222
+// 获取URL参数: // 获取URL参数: https://localhost:8080/?userId=111&roomId=10086
 const route = useRoute()
 const currentUserId = route.query.userId as string
 const roomId = route.query.roomId as string
-const targetId = route.query.targetId as string
 
-let pc: RTCPeerConnection | null
+// WebRTC 相关引用
 const localVideo = ref<HTMLVideoElement | null>(null)
 const remoteVideo = ref<HTMLVideoElement | null>(null)
-let chatChannel: RTCDataChannel | null
 
-// 添加状态管理变量
+// 状态管理
 const isCalling = ref(false)
 const callingTarget = ref<string | null>(null)
 const activeRoomId = ref<string | null>(null)
+const participants = ref<Array<{ userId: string }>>([])
+const localMessage = ref('')
+const remoteMessage = ref('')
+const chatHistory = ref<HTMLElement | null>(null)
 
+// WebRTC 对象
+let pc: RTCPeerConnection | null = null
+let chatChannel: RTCDataChannel | null = null
+let localStream: MediaStream | null = null
+
+// Socket 连接
 const socket = io('', {
   query: {
     userId: currentUserId,
@@ -99,67 +107,52 @@ const socket = io('', {
   }
 })
 
+// Socket 事件监听
 socket.on('connect', () => {
-  console.log('socket connected');
-
-  joinHandle()
+  console.log('Socket connected')
+  joinRoom()
 })
 
 socket.on('disconnect', () => {
-  console.log("socket disconnected");
+  console.log("Socket disconnected")
 })
 
 socket.on('connect_error', (error) => {
-  console.log("socket error: ", error);
+  console.error("Socket connection error: ", error)
+  message.error('连接服务器失败')
 })
-
-const handleAnswer = async (data: any) => {
-  console.log('收到answer: ', data)
-  if (!pc) return
-  await pc.setRemoteDescription(data.sdpObj)
-}
-
-const handleOffer = async (data: any) => {
-  console.log('========收到offer: ', data)
-  if (!pc) return
-  await pc.setRemoteDescription(data.sdpObj)
-  const answer = await pc.createAnswer()
-  await pc.setLocalDescription(answer)
-  socket.emit('message', buildMessage('answer', currentUserId, data.roomId, data.userId, answer))
-
-  // 设置呼叫状态
-  isCalling.value = true
-  callingTarget.value = data.userId
-  activeRoomId.value = data.roomId
-}
 
 socket.on("message", (data) => {
   console.log('收到消息: ', data)
+  handleMessage(data)
+})
+
+// 消息处理中心
+const handleMessage = (data: any) => {
   switch (data.type) {
     case 'join_self':
-      message.info('恭喜你！成功加入房间！');
-      break;
+      message.info('成功加入房间！')
+      break
     case 'room_users':
       participants.value = data.data
-      break;
+      break
     case 'call':
-      message.info(`${data.data.userId} 来电, 即将自动接听！`);
-      onCallHandle(data.data)
-      break;
+      handleIncomingCall(data.data)
+      break
     case 'hangup':
       hangup(true)
-      break;
+      break
     case 'offer':
       handleOffer(data.data)
-      break;
+      break
     case 'answer':
       handleAnswer(data.data)
-      break;
+      break
     case 'candidate':
       handleCandidate(data.data)
-      break;
+      break
   }
-});
+}
 
 // 构建消息体
 const buildMessage = (type: string, userId: string, roomId: string, targetId?: string, sdpObj?: any) => {
@@ -174,243 +167,313 @@ const buildMessage = (type: string, userId: string, roomId: string, targetId?: s
   }
 }
 
-const handleCandidate = async (data) => {
-  if (!pc) return
-  await pc.addIceCandidate(data.sdpObj)
-}
-
 // 加入房间
-const joinHandle = () => {
+const joinRoom = () => {
   socket.emit('message', buildMessage('join', currentUserId, roomId))
 }
 
+// 初始化 WebRTC 连接
+const initWebRTC = async (isCaller: boolean, targetUserId: string) => {
+  try {
+    // 创建 RTCPeerConnection
+    pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
+    })
+
+    // 设置事件处理器
+    setupPeerConnectionEvents(isCaller, targetUserId)
+
+    // 获取本地媒体流
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true
+    })
+
+    // 将本地流绑定到视频元素
+    if (localVideo.value) {
+      localVideo.value.srcObject = localStream
+    }
+
+    // 添加轨道到连接
+    localStream.getTracks().forEach(track => {
+      pc!.addTrack(track, localStream!)
+    })
+
+    return pc
+  } catch (error) {
+    console.error('获取媒体流失败:', error)
+    message.error('无法访问摄像头或麦克风')
+    return null
+  }
+}
+
+// 设置 PeerConnection 事件处理器
+const setupPeerConnectionEvents = (isCaller: boolean, targetUserId: string) => {
+  if (!pc) return
+
+  // 接收远程流
+  pc.ontrack = (event) => {
+    console.log(`${isCaller ? '主叫' : '被叫'}收到 ontrack:`, event)
+    if (remoteVideo.value) {
+      remoteVideo.value.srcObject = event.streams[0]!
+    }
+  }
+
+  // ICE 连接状态变化
+  pc.oniceconnectionstatechange = () => {
+    console.log('ICE连接状态变化:', pc!.iceConnectionState)
+    if (pc!.iceConnectionState === 'connected' || pc!.iceConnectionState === 'completed') {
+      console.log('WebRTC协商成功！')
+      message.success('连接已建立')
+    } else if (pc!.iceConnectionState === 'failed') {
+      console.log('WebRTC连接失败')
+      message.error('连接失败')
+      hangup()
+    }
+  }
+
+  // 连接状态变化
+  pc.onconnectionstatechange = () => {
+    console.log('连接状态变化:', pc!.connectionState)
+    if (pc!.connectionState === 'connected') {
+      console.log('WebRTC连接已建立')
+    } else if (pc!.connectionState === 'disconnected' || pc!.connectionState === 'failed') {
+      hangup()
+    }
+  }
+
+  // ICE 候选者处理
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      socket.emit('message', buildMessage(
+          'candidate',
+          currentUserId,
+          activeRoomId.value!,
+          targetUserId,
+          event.candidate
+      ))
+    }
+  }
+
+  // 数据通道处理
+  if (isCaller) {
+    chatChannel = pc.createDataChannel('chat')
+    setupDataChannel(chatChannel)
+  } else {
+    pc.ondatachannel = (event) => {
+      chatChannel = event.channel
+      setupDataChannel(chatChannel)
+    }
+  }
+}
+
+// 设置数据通道
 const setupDataChannel = (channel: RTCDataChannel) => {
   channel.onmessage = (event) => {
-    console.log('channel.onmessage: ', event)
+    console.log('收到数据消息:', event)
     remoteMessage.value = event.data
   }
-  channel.onopen = (e) => {
-    console.log('channel.onopen', e)
+
+  channel.onopen = () => {
+    console.log('数据通道已打开')
   }
-  channel.onclose = (e) => {
-    console.log('channel.onclose', e)
+
+  channel.onclose = () => {
+    console.log('数据通道已关闭')
+  }
+
+  channel.onerror = (error) => {
+    console.error('数据通道错误:', error)
   }
 }
 
-const callerHandle = async () => {
-  pc = new RTCPeerConnection()
-  if (!pc) return
-  pc.ontrack = (event) => {
-    // 将远端流绑定到 video 元素
-    console.log('主叫收到 ontrack: ', event)
-    remoteVideo.value!.srcObject = event.streams[0]!
-  }
-  pc.oniceconnectionstatechange = () => {
-    if (!pc) return
-    console.log('ICE连接状态变化:', pc.iceConnectionState);
-    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-      console.log('WebRTC协商成功！');
-    } else if (pc.iceConnectionState === 'failed') {
-      console.log('WebRTC连接失败');
-    }
-  };
-  pc.onconnectionstatechange = () => {
-    if (!pc) return
-    console.log('连接状态变化:', pc.connectionState);
-    if (pc.connectionState === 'connected') {
-      console.log('WebRTC连接已建立');
-    }
-  };
-  pc.onicecandidate = (event) => {
-    console.log('onicecandidate: ', event)
-    // 和对方交换 ice
-    if (event.candidate) {
-      socket.emit('message', buildMessage('candidate', currentUserId, roomId, targetId, event.candidate))
-    }
-  }
-  chatChannel = pc.createDataChannel('chat')
+// 发起呼叫
+const initiateCall = async (targetUserId: string) => {
+  console.log(`正在呼叫用户 ${targetUserId}`)
 
-  setupDataChannel(chatChannel)
+  // 通知被叫方
+  socket.emit('message', buildMessage(
+      'call',
+      currentUserId,
+      roomId,
+      targetUserId
+  ))
 
-  // 获取本地音视频流
-  const stream = await navigator.mediaDevices.getUserMedia({video: true, audio: true})
-  stream.getTracks().forEach(track => {
-    if (!pc) return
-    pc.addTrack(track, stream)
-  })
-  // 创建 offer
-  const offer = await pc.createOffer()
-  console.log('=====', offer.sdp)
-  await pc.setLocalDescription(offer)
-  // 将本地音视频流绑定到 video 元素
-  if (!localVideo.value) {
-    console.error('localVideo is null')
-    return
-  }
-  localVideo.value.srcObject = stream
-  console.log('====')
-  socket.emit('message', buildMessage('offer', currentUserId, roomId, targetId, offer))
-}
+  // 初始化 WebRTC
+  const peerConnection = await initWebRTC(true, targetUserId)
+  if (!peerConnection) return
 
-// 收到呼叫
-const onCallHandle = async (data: any) => {
-  console.log('====', data)
-  pc = new RTCPeerConnection()
-  pc.ontrack = (event) => {
-    console.log('被叫收到 ontrack: ', event)
-    remoteVideo.value!.srcObject = event.streams[0]!
-  }
-  pc.oniceconnectionstatechange = () => {
-    if (!pc) return
-    console.log('ICE连接状态变化:', pc.iceConnectionState);
-    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-      console.log('WebRTC协商成功！');
-      // 设置呼叫状态
-      isCalling.value = true
-      callingTarget.value = data.userId
-      activeRoomId.value = data.roomId
-    } else if (pc.iceConnectionState === 'failed') {
-      console.log('WebRTC连接失败');
-    }
-  };
-  pc.onconnectionstatechange = () => {
-    if (!pc) return
-    console.log('连接状态变化:', pc.connectionState);
-    if (pc.connectionState === 'connected') {
-      console.log('WebRTC连接已建立');
-    }
-  };
-  pc.onicecandidate = (event) => {
-    console.log('被叫收到 onicecandidate: ', event)
-    // 和对方交换 ice
-    if (event.candidate) {
-      socket.emit('message', buildMessage('candidate', currentUserId, data.roomId, data.userId, event.candidate))
-    }
-  }
-
-  pc.ondatachannel = (event) => {
-    console.log('onicecandidate: ', event)
-    chatChannel = event.channel
-    setupDataChannel(chatChannel)
-  };
-  console.log('========收到呼叫准备获取本地流')
-  const stream = await navigator.mediaDevices.getUserMedia({video: true, audio: true})
-  console.log('========收到呼叫，准备执行 addTrack')
-  stream.getTracks().forEach(track => {
-    if (!pc) return
-    pc.addTrack(track, stream)
-  })
-  if (!localVideo.value) {
-    console.error('localVideo is null')
-    return
-  }
-  localVideo.value.srcObject = stream
-}
-
-// 呼叫某人
-const callParticipant = (targetId: string) => {
-  console.log(`正在呼叫 ${roomId} 房间，用户 ${targetId}`)
-  const message = buildMessage('call', currentUserId, roomId, targetId)
-
-  socket.emit('message', message)
-  callerHandle()
-
-  // 更新呼叫状态
-  isCalling.value = true
-  callingTarget.value = targetId
+  // 更新状态
+  callingTarget.value = targetUserId
   activeRoomId.value = roomId
+  isCalling.value = true
+
+  // 创建 Offer
+  try {
+    const offer = await peerConnection.createOffer()
+    await peerConnection.setLocalDescription(offer)
+
+    // 发送 Offer
+    socket.emit('message', buildMessage(
+        'offer',
+        currentUserId,
+        roomId,
+        targetUserId,
+        offer
+    ))
+  } catch (error) {
+    console.error('创建 Offer 失败:', error)
+    message.error('呼叫失败')
+    hangup()
+  }
 }
 
-const hangup = (isRemote = false) => {
-  console.log('准备断开P2P连接...')
+// 处理来电
+const handleIncomingCall = async (data: any) => {
+  console.log('收到呼叫:', data)
+  message.info(`${data.userId} 来电，即将自动接听！`)
 
-  // 1. 停止本地媒体流
-  if (localVideo.value?.srcObject) {
-    const tracks = (localVideo.value.srcObject as MediaStream).getTracks()
-    tracks.forEach(track => track.stop())
+  // 初始化 WebRTC
+  const peerConnection = await initWebRTC(false, data.userId)
+  if (!peerConnection) return
+
+  // 更新状态
+  callingTarget.value = data.userId
+  activeRoomId.value = data.roomId
+  isCalling.value = true
+}
+
+// 处理 Offer
+const handleOffer = async (data: any) => {
+  console.log('收到 Offer:', data)
+  if (!pc) return
+
+  try {
+    await pc.setRemoteDescription(data.sdpObj)
+    const answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    socket.emit('message', buildMessage(
+        'answer',
+        currentUserId,
+        data.roomId,
+        data.userId,
+        answer
+    ))
+  } catch (error) {
+    console.error('处理 Offer 失败:', error)
+    message.error('连接建立失败')
+    hangup()
+  }
+}
+
+// 处理 Answer
+const handleAnswer = async (data: any) => {
+  console.log('收到 Answer:', data)
+  if (!pc) return
+
+  try {
+    await pc.setRemoteDescription(data.sdpObj)
+  } catch (error) {
+    console.error('处理 Answer 失败:', error)
+    message.error('连接建立失败')
+    hangup()
+  }
+}
+
+// 处理 ICE 候选者
+const handleCandidate = async (data: any) => {
+  if (!pc) return
+
+  try {
+    await pc.addIceCandidate(data.sdpObj)
+  } catch (error) {
+    console.error('添加 ICE 候选者失败:', error)
+  }
+}
+
+// 挂断通话
+const hangup = (isRemote = false) => {
+  console.log('准备断开连接...')
+
+  // 停止本地媒体流
+  if (localStream) {
+    localStream.getTracks().forEach(track => track.stop())
+    localStream = null
+  }
+
+  // 清理本地视频元素
+  if (localVideo.value) {
     localVideo.value.srcObject = null
   }
 
-  // 2. 关闭 dataChannel
+  // 清理远程视频元素
+  if (remoteVideo.value) {
+    remoteVideo.value.srcObject = null
+  }
+
+  // 关闭数据通道
   if (chatChannel) {
     chatChannel.close()
     chatChannel = null
   }
 
-  // 3. 关闭 peerConnection
+  // 关闭 PeerConnection
   if (pc) {
     pc.close()
     pc = null
   }
 
-  // 4. 通知对方（可选，但建议做）
+  // 通知对方（如果不是远程挂断）
   if (!isRemote && activeRoomId.value && callingTarget.value) {
-    socket.emit('message', buildMessage('hangup', currentUserId, activeRoomId.value, callingTarget.value))
+    socket.emit('message', buildMessage(
+        'hangup',
+        currentUserId,
+        activeRoomId.value,
+        callingTarget.value
+    ))
   }
 
-  // 5. 重置呼叫状态
+  // 重置状态
   isCalling.value = false
   callingTarget.value = null
   activeRoomId.value = null
 
-  // 6. UI 清理
-  if (remoteVideo.value) {
-    remoteVideo.value.srcObject = null
-  }
-
-  // 7. 显示提示信息
+  // 显示提示信息
   if (isRemote) {
-    message.info('对方已挂断通话');
+    message.info('对方已挂断通话')
   } else {
-    message.info('通话已结束');
+    message.info('通话已结束')
   }
 
-  console.log('P2P 连接已关闭')
+  console.log('连接已关闭')
 }
-
-// 聊天相关
-const chatHistory = ref<HTMLElement | null>(null)
-const localMessage = ref('')
-const remoteMessage = ref('')
-
-
-// 参会人员列表
-const participants = ref()
-
 
 // 发送消息
 const sendMessage = () => {
-  if (localMessage.value.trim() === '') return
+  const msg = localMessage.value.trim()
+  if (!msg) return
 
-  chatChannel?.send(localMessage.value)
-
-  localMessage.value = ''
+  if (chatChannel && chatChannel.readyState === 'open') {
+    chatChannel.send(msg)
+    localMessage.value = ''
+  } else {
+    message.warning('数据通道未就绪，无法发送消息')
+  }
 }
 
-// 格式化时间
-const formatTime = (timestamp: number) => {
-  const date = new Date(timestamp)
-  return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`
-}
+// 组件卸载时清理资源
+onUnmounted(() => {
+  hangup()
+  socket.disconnect()
+})
 
-// 滚动到聊天记录底部
-const scrollToBottom = () => {
-  nextTick(() => {
-    if (chatHistory.value) {
-      chatHistory.value.scrollTop = chatHistory.value.scrollHeight
-    }
-  })
-}
-
-// 初始化视频
-const initVideo = () => {
-  // 这里可以添加实际的视频流获取逻辑
-  console.log('初始化视频...')
-}
-
+// 初始化
 onMounted(() => {
-  initVideo()
-  scrollToBottom()
+  console.log('初始化一对一通话组件...')
 })
 </script>
 
@@ -470,6 +533,19 @@ onMounted(() => {
 .call-buttons {
   display: flex;
   gap: 5px;
+}
+
+.call-button {
+  padding: 6px 12px;
+  background-color: #409eff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.call-button:hover {
+  background-color: #337ecc;
 }
 
 .hangup-button {
@@ -556,50 +632,6 @@ onMounted(() => {
   padding: 16px;
   overflow-y: auto;
   background-color: #fafafa;
-}
-
-.message-item {
-  margin-bottom: 16px;
-  max-width: 80%;
-}
-
-.message-item.sent {
-  margin-left: auto;
-}
-
-.message-item.received {
-  margin-right: auto;
-}
-
-.message-sender {
-  font-size: 12px;
-  color: #999;
-  margin-bottom: 4px;
-}
-
-.message-content {
-  padding: 8px 12px;
-  border-radius: 8px;
-  word-wrap: break-word;
-}
-
-.message-item.sent .message-content {
-  background-color: #409eff;
-  color: white;
-  border-bottom-right-radius: 0;
-}
-
-.message-item.received .message-content {
-  background-color: white;
-  border: 1px solid #eee;
-  border-bottom-left-radius: 0;
-}
-
-.message-time {
-  font-size: 10px;
-  color: #999;
-  text-align: right;
-  margin-top: 4px;
 }
 
 .chat-input-area {
